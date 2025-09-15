@@ -486,5 +486,4 @@ function PoolComponent({ account }) {
 }
 
 export default App;
-artifacts/contracts/SwapSphereRouter.sol/SwapSphereRouter.json to src/abis/
 
