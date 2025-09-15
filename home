@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./SwapSpherePair.sol";
+
+contract SwapSphereFactory is Ownable {
+    mapping(address => mapping(address => address)) public getPair;
+    address[] public allPairs;
+
+    event PairCreated(address indexed token0, address indexed token1, address pair, uint);
+
+    constructor() Ownable(msg.sender) {}
+
+    function createPair(address tokenA, address tokenB) external onlyOwner returns (address pair) {
+        require(tokenA != tokenB, "Identical addresses");
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(getPair[token0][token1] == address(0), "Pair exists");
+
+        pair = address(new SwapSpherePair{salt: keccak256(abi.encodePacked(token0, token1))}());
+        SwapSpherePair(pair).initialize(token0, token1);
+        getPair[token0][token1] = pair;
+        getPair[token1][token0] = pair;
+        allPairs.push(pair);
+        emit PairCreated(token0, token1, pair, allPairs.length);
+    }
+}
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+contract SwapSpherePair is ERC20 {
+    address public factory;
+    address public token0;
+    address public token1;
+
+    uint112 private reserve0;
+    uint112 private reserve1;
+    uint32 private blockTimestampLast;
+
+    function initialize(address _token0, address _token1) external {
+        factory = msg.sender;
+        token0 = _token0;
+        token1 = _token1;
+    }
+
+    function mint(address to) external returns (uint liquidity) {
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves();
+        uint balance0 = IERC20(token0).balanceOf(address(this));
+        uint balance1 = IERC20(token1).balanceOf(address(this));
+        uint amount0 = balance0 - _reserve0;
+        uint amount1 = balance1 - _reserve1;
+
+        if (_reserve0 > 0 && _reserve1 > 0) {
+            require(amount0 * _reserve1 == _reserve0 * amount1, "Invariant mismatch");
+        } else {
+            require(amount0 > 0 && amount1 > 0, "Insufficient liquidity");
+        }
+
+        liquidity = sqrt(amount0 * amount1);
+        _mint(to, liquidity);
+        _update(balance0, balance1);
+        return liquidity;
+    }
+
+    function swap(uint amount0Out, uint amount1Out, address to) external {
+        require(amount0Out > 0 || amount1Out > 0, "Insufficient output");
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves();
+        require(amount0Out < _reserve0 && amount1Out < _reserve1, "Insufficient liquidity");
+
+        uint balance0 = IERC20(token0).balanceOf(address(this)) + amount0Out;
+        uint balance1 = IERC20(token1).balanceOf(address(this)) + amount1Out;
+        require(balance0 * balance1 >= uint(_reserve0) * _reserve1, "K invariant");
+
+        if (amount0Out > 0) IERC20(token0).transfer(to, amount0Out);
+        if (amount1Out > 0) IERC20(token1).transfer(to, amount1Out);
+        _update(balance0, balance1);
+    }
+
+    function getReserves() public view returns (uint112, uint112, uint32) {
+        return (reserve0, reserve1, blockTimestampLast);
+    }
+
+    function _update(uint balance0, uint balance1) private {
+        reserve0 = uint112(balance0);
+        reserve1 = uint112(balance1);
+        blockTimestampLast = uint32(block.timestamp);
+    }
+
+    function sqrt(uint y) internal pure returns (uint z) {
+        if (y > 3) {
+            z = y;
+            uint x = y / 2 + 1;
+            while (x < z) { z = x; x = (y / x + x) / 2; }
+        } else if (y != 0) { z = 1; }
+    }
+}
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./SwapSphereFactory.sol";
+import "./SwapSpherePair.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract SwapSphereRouter {
+    address public immutable factory;
+    address public immutable wkas;  // Wrapped KAS
+
+    constructor(address _factory, address _wkas) {
+        factory = _factory;
+        wkas = _wkas;
+    }
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external returns (uint amountA, uint amountB, uint liquidity) {
+        require(deadline >= block.timestamp, "Deadline expired");
+        if (factory != SwapSphereFactory(msg.sender).getPair(tokenA, tokenB)) {
+            SwapSphereFactory(factory).createPair(tokenA, tokenB);
+        }
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = SwapSphereFactory(factory).getPair(tokenA, tokenB);
+        IERC20(tokenA).transferFrom(msg.sender, pair, amountA);
+        IERC20(tokenB).transferFrom(msg.sender, pair, amountB);
+        liquidity = SwapSpherePair(pair).mint(to);
+    }
+
+    function _addLiquidity(address tokenA, address tokenB, uint amountADesired, uint amountBDesired, uint amountAMin, uint amountBMin) internal view returns (uint amountA, uint amountB) {
+        (uint reserveA, uint reserveB) = getReserves(tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, "Insufficient B");
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, "Insufficient A");
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts) {
+        require(deadline >= block.timestamp, "Deadline expired");
+        amounts = getAmountsOut(amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, "Insufficient output");
+        IERC20(path[0]).transferFrom(msg.sender, SwapSpherePair(getPair(path[0], path[1])).address, amounts[0]);
+        _swap(amounts, path, to);
+    }
+
+    // Helper functions (getReserves, quote, getAmountsOut, _swap) - implement constant product math as in Uniswap V2
+    function getReserves(address tokenA, address tokenB) internal view returns (uint, uint) {
+        address pair = SwapSphereFactory(factory).getPair(tokenA, tokenB);
+        (uint reserve0, uint reserve1,) = SwapSpherePair(pair).getReserves();
+        return tokenA == SwapSpherePair(pair).token0() ? (reserve0, reserve1) : (reserve1, reserve0);
+    }
+
+    function quote(uint amountA, uint reserveA, uint reserveB) internal pure returns (uint amountB) {
+        require(amountA > 0, "Insufficient amount");
+        require(reserveA > 0 && reserveB > 0, "Insufficient liquidity");
+        amountB = (amountA * reserveB) / reserveA;
+    }
+
+    function getAmountsOut(uint amountIn, address[] memory path) internal view returns (uint[] memory amounts) {
+        require(path.length >= 2, "Invalid path");
+        amounts = new uint[](path.length);
+        amounts[0] = amountIn;
+        for (uint i; i < path.length - 1; i++) {
+            (uint reserveIn, uint reserveOut) = getReserves(path[i], path[i + 1]);
+            amounts[i + 1] = getAmountOut(amounts[i], reserveIn, reserveOut);
+        }
+    }
+
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) internal pure returns (uint amountOut) {
+        require(amountIn > 0, "Insufficient input");
+        require(reserveIn > 0 && reserveOut > 0, "Insufficient liquidity");
+        uint amountInWithFee = amountIn * 997;
+        uint numerator = amountInWithFee * reserveOut;
+        uint denominator = (reserveIn * 1000) + amountInWithFee;
+        amountOut = numerator / denominator;
+    }
+
+    function getPair(address tokenA, address tokenB) internal view returns (address) {
+        return SwapSphereFactory(factory).getPair(tokenA, tokenB);
+    }
+
+    function _swap(uint[] memory amounts, address[] memory path, address to) internal {
+        for (uint i; i < path.length - 1; i++) {
+            address[] memory _path = new address[](2);
+            _path[0] = path[i];
+            _path[1] = path[i + 1];
+            uint amountOut = amounts[i + 1];
+            (address input, address output) = input0IsToken0(path[i], path[i + 1]) ? (path[i], path[i + 1]) : (path[i + 1], path[i]);
+            SwapSpherePair(pairFor(_path[0], _path[1])).swap(
+                input == token0 ? amountOut : 0,
+                input == token1 ? amountOut : 0,
+                to
+            );
+        }
+    }
+
+    // Additional helpers: pairFor, input0IsToken0 (implement sorting logic)
+    function pairFor(address tokenA, address tokenB) internal pure returns (address pair) {
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        pair = address(uint160(keccak256(abi.encodePacked(token0, token1))));
+    }
+
+    function input0IsToken0(address tokenIn, address tokenOut) internal pure returns (bool) {
+        return tokenIn < tokenOut;
+    }
+}
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying with:", deployer.address);
+
+  // Deploy WKAS (simple ERC20 wrapper for KAS)
+  const WKAS = await ethers.getContractFactory("ERC20");
+  const wkas = await WKAS.deploy("Wrapped KAS", "WKAS");
+  await wkas.waitForDeployment();
+  console.log("WKAS deployed to:", await wkas.getAddress());
+
+  const Factory = await ethers.getContractFactory("SwapSphereFactory");
+  const factory = await Factory.deploy(deployer.address);
+  await factory.waitForDeployment();
+  console.log("Factory deployed to:", await factory.getAddress());
+
+  const Router = await ethers.getContractFactory("SwapSphereRouter");
+  const router = await Router.deploy(await factory.getAddress(), await wkas.getAddress());
+  await router.waitForDeployment();
+  console.log("Router deployed to:", await router.getAddress());
+
+  // Create KAS/NACHO pair
+  const NACHO = "0x...NACHO_ADDRESS"; // Replace with real NACHO KRC-20
+  await factory.createPair(await wkas.getAddress(), NACHO);
+  console.log("KAS/NACHO pair created!");
+}
+
+main().catch(console.error);
+require("@nomicfoundation/hardhat-toolbox");
+require("@openzeppelin/hardhat-upgrades");
+
+module.exports = {
+  solidity: "0.8.20",
+  networks: {
+    kasplexTestnet: {
+      url: "https://rpc-testnet.kasplex.org",
+      accounts: ["YOUR_PRIVATE_KEY"],
+      chainId: 71693
+    }
+  }
+};
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { ChakraProvider, extendTheme } from '@chakra-ui/react';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+
+const theme = extendTheme({
+  colors: {
+    sphere: {
+      50: '#0F0F23', // Deep space blue
+      500: '#00D4FF', // Neon Kaspa blue
+      600: '#FF6B35', // Fiery Nacho orange
+      gradient: 'linear(to-r, sphere.500 0%, sphere.600 50%, sphere.500 100%)',
+    },
+  },
+  components: {
+    Button: {
+      baseStyle: {
+        boxShadow: '0 0 20px rgba(0, 212, 255, 0.5)',
+        _hover: { boxShadow: '0 0 30px rgba(255, 107, 53, 0.7)' },
+      },
+    },
+  },
+});
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <ChakraProvider theme={theme}>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </ChakraProvider>
+);
+import { useState } from 'react';
+import { Routes, Route, Link } from 'react-router-dom';
+import { Box, Flex, Heading, Button, Container, Text, useToast, VStack, Input, Select, IconButton } from '@chakra-ui/react';
+import { motion } from 'framer-motion';
+import { ethers } from 'ethers';
+import { Swap, ArrowDown, Plus, Minus } from 'lucide-react';
+import RouterABI from './abis/SwapSphereRouter.json'; // ABI from artifacts
+
+const ROUTER_ADDRESS = 'YOUR_ROUTER_ADDRESS'; // From deployment
+const WKAS = 'YOUR_WKAS_ADDRESS';
+const NACHO = '0x...NACHO_ADDRESS'; // Real KRC-20
+
+const MotionBox = motion(Box);
+const MotionFlex = motion(Flex);
+
+function App() {
+  const [account, setAccount] = useState(null);
+  const toast = useToast();
+
+  const connectWallet = async () => {
+    if (window.ethereum) {
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const accounts = await provider.send('eth_requestAccounts', []);
+        setAccount(accounts[0]);
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x1189D' }], // Kasplex testnet
+        });
+        toast({ title: 'Connected to SwapSphere!', status: 'success', duration: 2000 });
+      } catch (error) {
+        toast({ title: 'Connection Failed', status: 'error', duration: 3000 });
+      }
+    }
+  };
+
+  return (
+    <Box bg="sphere.50" minH="100vh" color="white">
+      <Container maxW="6xl" py={4}>
+        <MotionFlex justify="space-between" align="center" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 1 }}>
+          <Heading as="h1" size="3xl" bgGradient="sphere.gradient" bgClip="text">
+            🌌 SwapSphere
+          </Heading>
+          <Flex gap={4}>
+            <Link to="/swap"><Button variant="outline">Swap</Button></Link>
+            <Link to="/pool"><Button variant="outline">Pool</Button></Link>
+            <Button onClick={connectWallet} colorScheme="sphere" leftIcon={account ? <Text>{account.slice(0,6)}...</Text> : 'Connect'}>
+              {account ? 'Connected' : 'Wallet'}
+            </Button>
+          </Flex>
+        </MotionFlex>
+        <Routes>
+          <Route path="/swap" element={<SwapComponent account={account} />} />
+          <Route path="/pool" element={<PoolComponent account={account} />} />
+          <Route path="/" element={<Hero />} />
+        </Routes>
+      </Container>
+    </Box>
+  );
+}
+
+// Hero: Eye-catching landing
+function Hero() {
+  return (
+    <MotionBox initial={{ y: 50, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ duration: 1.5 }}>
+      <Flex direction="column" align="center" pt={20}>
+        <Heading size="4xl" bgGradient="sphere.gradient" bgClip="text" mb={4}>
+          Enter the Sphere of Speed
+        </Heading>
+        <Text fontSize="xl" textAlign="center" mb={8}>
+          Swap KAS & NACHO in seconds on Kaspa's fastest DEX. Liquidity? Yours to command.
+        </Text>
+        <Flex gap={4}>
+          <Link to="/swap"><Button size="lg" colorScheme="sphere" leftIcon={<Swap />}>Start Swapping</Button></Link>
+          <Link to="/pool"><Button size="lg" variant="outline" leftIcon={<Plus />}>Add Liquidity</Button></Link>
+        </Flex>
+      </Flex>
+    </MotionBox>
+  );
+}
+
+// Swap Component
+function SwapComponent({ account }) {
+  const [amountIn, setAmountIn] = useState('');
+  const [amountOut, setAmountOut] = useState('');
+  const [path, setPath] = useState([WKAS, NACHO]); // Default KAS to NACHO
+  const toast = useToast();
+
+  const handleSwap = async () => {
+    if (!account || !amountIn) return toast({ title: 'Connect & Enter Amount', status: 'warning' });
+    try {
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const router = new ethers.Contract(ROUTER_ADDRESS, RouterABI.abi, signer);
+      const amounts = await router.getAmountsOut(ethers.parseEther(amountIn), path);
+      setAmountOut(ethers.formatEther(amounts[1]));
+      // Approve & Swap
+      const tokenIn = new ethers.Contract(path[0], ['function approve(address,uint256)'], signer);
+      await tokenIn.approve(ROUTER_ADDRESS, ethers.parseEther(amountIn));
+      const tx = await router.swapExactTokensForTokens(
+        ethers.parseEther(amountIn),
+        0, // Slippage
+        path,
+        account,
+        Math.floor(Date.now() / 1000) + 60 * 20
+      );
+      await tx.wait();
+      toast({ title: 'Swap Complete! 🌟', status: 'success' });
+    } catch (error) {
+      toast({ title: 'Swap Failed', status: 'error' });
+    }
+  };
+
+  return (
+    <MotionBox initial={{ scale: 0.9 }} animate={{ scale: 1 }} p={8} bg="whiteAlpha.100" borderRadius="2xl" boxShadow="0 0 50px rgba(0,212,255,0.3)">
+      <VStack spacing={6}>
+        <Heading>⚡ Instant Swap</Heading>
+        <Input placeholder="Enter Amount" value={amountIn} onChange={(e) => setAmountIn(e.target.value)} type="number" />
+        <Select value={path[0]} onChange={(e) => setPath([e.target.value, path[1]])}>
+          <option value={WKAS}>KAS</option>
+          <option value={NACHO}>NACHO</option>
+        </Select>
+        <IconButton icon={<ArrowDown />} aria-label="Reverse" onClick={() => setPath([path[1], path[0]])} size="lg" />
+        <Select value={path[1]} onChange={(e) => setPath([path[0], e.target.value])}>
+          <option value={NACHO}>NACHO</option>
+          <option value={WKAS}>KAS</option>
+        </Select>
+        <Text>Est. Out: {amountOut} {path[1] === NACHO ? 'NACHO' : 'KAS'}</Text>
+        <Button colorScheme="sphere" onClick={handleSwap} w="full" leftIcon={<Swap />} size="lg">
+          Swap
+        </Button>
+      </VStack>
+    </MotionBox>
+  );
+}
+
+// Pool Component
+function PoolComponent({ account }) {
+  const [amountA, setAmountA] = useState('');
+  const [amountB, setAmountB] = useState('');
+  const toast = useToast();
+
+  const handleAddLiquidity = async () => {
+    if (!account) return toast({ title: 'Connect Wallet', status: 'warning' });
+    try {
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const router = new ethers.Contract(ROUTER_ADDRESS, RouterABI.abi, signer);
+      // Approve A & B
+      const tokenA = new ethers.Contract(WKAS, ['function approve(address,uint256)'], signer);
+      await tokenA.approve(ROUTER_ADDRESS, ethers.parseEther(amountA));
+      const tokenB = new ethers.Contract(NACHO, ['function approve(address,uint256)'], signer);
+      await tokenB.approve(ROUTER_ADDRESS, ethers.parseEther(amountB));
+      // Add
+      const tx = await router.addLiquidity(
+        WKAS, NACHO, ethers.parseEther(amountA), ethers.parseEther(amountB),
+        0, 0, account, Math.floor(Date.now() / 1000) + 60 * 20
+      );
+      await tx.wait();
+      toast({ title: 'Liquidity Added! 🎉', status: 'success' });
+    } catch (error) {
+      toast({ title: 'Failed to Add Liquidity', status: 'error' });
+    }
+  };
+
+  const handleRemoveLiquidity = () => { /* Implement burn/remove logic */ };
+
+  return (
+    <MotionBox initial={{ scale: 0.9 }} animate={{ scale: 1 }} p={8} bg="whiteAlpha.100" borderRadius="2xl" boxShadow="0 0 50px rgba(255,107,53,0.3)">
+      <VStack spacing={6}>
+        <Heading>💧 Liquidity Pool</Heading>
+        <Input placeholder="KAS Amount" value={amountA} onChange={(e) => setAmountA(e.target.value)} type="number" />
+        <IconButton icon={<Plus />} aria-label="Add" size="lg" colorScheme="sphere" />
+        <Input placeholder="NACHO Amount" value={amountB} onChange={(e) => setAmountB(e.target.value)} type="number" />
+        <Button colorScheme="sphere" onClick={handleAddLiquidity} w="full" leftIcon={<Plus />} size="lg">
+          Add Liquidity
+        </Button>
+        <Button variant="outline" onClick={handleRemoveLiquidity} w="full" leftIcon={<Minus />} size="lg">
+          Remove Liquidity
+        </Button>
+      </VStack>
+    </MotionBox>
+  );
+}
+
+export default App;
+artifacts/contracts/SwapSphereRouter.sol/SwapSphereRouter.json to src/abis/
+
